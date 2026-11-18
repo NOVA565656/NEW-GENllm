@@ -1,17 +1,13 @@
 [settings]
-# "wise" is the conservative quota mode: it spreads routing and keeps
-# output budgets small so you don't burn a provider's daily cap.
 mode = "wise"
 
 [keys]
-# freellmpool reads these from the environment, but you can also paste
-# them here directly if you prefer. Environment variables take precedence.
+# Keys are read from environment variables by default.
+# You can also paste them here directly, but .env is safer.
 # GROQ_API_KEY = "gsk_..."
-# MISTRAL_API_KEY = "..."
+# GEMINI_API_KEY = "..."
 # CEREBRAS_API_KEY = "..."
-# CLOUDFLARE_API_TOKEN = "..."
-# CLOUDFLARE_ACCOUNT_ID = "..."
 
 [aliases]
-# "auto" lets the pool pick the healthiest free route for each call.
 auto = "groq/llama-3.3-70b-versatile"
+security = "gemini/gemini-2.5-flash"   # <-- Stage 2 routes here
