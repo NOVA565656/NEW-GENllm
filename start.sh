@@ -29,14 +29,15 @@ freellmpool proxy --port 8080 &
 POOL_PID=$!
 sleep 3
 
-# 5. Start the Telegram bot with Workarounds
-echo "Starting Telegram bot for User ID: ${TELEGRAM_ADMIN_USER_ID}..."
+# 5. Configure Telegram bot
+echo "Configuring Telegram bot for User ID: ${TELEGRAM_ADMIN_USER_ID}..."
 
-# WORKAROUND A: Force the ID into the environment variable that FastMCP reads
-export FASTMCP_SERVER_AUTH_ALLOW_USER="${TELEGRAM_ADMIN_USER_ID}"
+# Set environment variables expected by AMCP's underlying framework
+export AMCP_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 export AMCP_TELEGRAM_ALLOWED_USERS="${TELEGRAM_ADMIN_USER_ID}"
+export AMCP_TELEGRAM_ADMIN_USERS="${TELEGRAM_ADMIN_USER_ID}"
 
-# WORKAROUND B: Generate the config.toml file that AMCP looks for
+# Write the config file exactly as AMCP expects it
 mkdir -p ~/.config/amcp
 cat > ~/.config/amcp/config.toml <<EOF
 [llm]
@@ -49,8 +50,9 @@ token = "${TELEGRAM_BOT_TOKEN}"
 allowed_users = ["${TELEGRAM_ADMIN_USER_ID}"]
 EOF
 
-# Start the bot
-amcp telegram start --allow-user "${TELEGRAM_ADMIN_USER_ID}" || {
+# 6. Start the bot using the correct plural flag
+echo "Starting Telegram bot..."
+amcp telegram start --allowed-users "${TELEGRAM_ADMIN_USER_ID}" || {
     echo "Bot stopped. Shutting down freellmpool..."
     kill $POOL_PID
     exit 1
