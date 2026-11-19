@@ -11,12 +11,6 @@ export FREELLMPOOL_CONFIG="$(pwd)/config/freellmpool.toml"
 # 2. Validate Telegram User ID
 if [ -z "${TELEGRAM_ADMIN_USER_ID:-}" ]; then
     echo "ERROR: TELEGRAM_ADMIN_USER_ID is empty in your .env file."
-    echo "Get your ID from @userinfobot on Telegram, then set it in .env"
-    exit 1
-fi
-
-if ! [[ "${TELEGRAM_ADMIN_USER_ID}" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: TELEGRAM_ADMIN_USER_ID must be a number (e.g., 123456789)."
     exit 1
 fi
 
@@ -33,15 +27,29 @@ sleep 1
 echo "Starting freellmpool on port 8080..."
 freellmpool proxy --port 8080 &
 POOL_PID=$!
-
-# Wait for the proxy to be ready
 sleep 3
 
-# 5. Start the Telegram bot with the validated User ID
+# 5. Start the Telegram bot with Workarounds
 echo "Starting Telegram bot for User ID: ${TELEGRAM_ADMIN_USER_ID}..."
-set -a; source config/amcp.env; set +a
 
-# Pass the flag explicitly to avoid empty arguments
+# WORKAROUND A: Force the ID into the environment variable that FastMCP reads
+export FASTMCP_SERVER_AUTH_ALLOW_USER="${TELEGRAM_ADMIN_USER_ID}"
+export AMCP_TELEGRAM_ALLOWED_USERS="${TELEGRAM_ADMIN_USER_ID}"
+
+# WORKAROUND B: Generate the config.toml file that AMCP looks for
+mkdir -p ~/.config/amcp
+cat > ~/.config/amcp/config.toml <<EOF
+[llm]
+base_url = "http://localhost:8080/v1"
+model = "auto"
+api_key = "anything"
+
+[telegram]
+token = "${TELEGRAM_BOT_TOKEN}"
+allowed_users = ["${TELEGRAM_ADMIN_USER_ID}"]
+EOF
+
+# Start the bot
 amcp telegram start --allow-user "${TELEGRAM_ADMIN_USER_ID}" || {
     echo "Bot stopped. Shutting down freellmpool..."
     kill $POOL_PID
