@@ -52,7 +52,7 @@ EOF
 
 # 6. Start the bot using the correct plural flag
 echo "Starting Telegram bot..."
-amcp telegram start --allowed-users "${TELEGRAM_ADMIN_USER_ID}" || {
+amcp telegram start --allow-user "${TELEGRAM_ADMIN_USER_ID}" || {
     echo "Bot stopped. Shutting down freellmpool..."
     kill $POOL_PID
     exit 1
