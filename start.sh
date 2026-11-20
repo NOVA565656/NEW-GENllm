@@ -11,9 +11,9 @@ set +a
 : "${GROQ_API_KEY:?Set GROQ_API_KEY in .env}"
 : "${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}"
 : "${NVIDIA_API_KEY:?Set NVIDIA_API_KEY in .env}"
+: "${NVIDIA_MODEL:?Set NVIDIA_MODEL in .env}"
 : "${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in .env}"
 : "${CLOUDFLARE_ACCOUNT_ID:?Set CLOUDFLARE_ACCOUNT_ID in .env}"
-: "${NVIDIA_MODEL:?Set NVIDIA_MODEL in .env}"
 : "${CLOUDFLARE_MODEL:?Set CLOUDFLARE_MODEL in .env}"
 
 mkdir -p ~/.config/amcp
@@ -74,6 +74,9 @@ group_policy = "mention"
 typing_indicator = true
 typing_interval_seconds = 4
 max_queue_size = 20
+assistant_mode = false
+
+[telegram.streaming]
 streaming_enabled = true
 streaming_interval_seconds = 1.5
 streaming_min_chars = 50
@@ -87,4 +90,4 @@ export AMCP_TELEGRAM_ALLOWED_USERS="${TELEGRAM_ADMIN_USER_ID}"
 export AMCP_TELEGRAM_ADMIN_USERS="${TELEGRAM_ADMIN_USER_ID}"
 
 echo "Starting Telegram bot..."
-amcp telegram start --allow-user "${TELEGRAM_ADMIN_USER_ID}"
+exec amcp telegram start --allow-user "${TELEGRAM_ADMIN_USER_ID}"
