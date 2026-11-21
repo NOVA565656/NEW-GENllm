@@ -51,7 +51,7 @@ class ProviderChain:
     def __init__(self) -> None:
         self.groq_model = os.getenv(
             "GROQ_MODEL",
-            "llama-3.3-70b-versatile",
+            ""openai/gpt-oss-120b",
         )
         self.gemini_model = os.getenv(
             "GEMINI_MODEL",
