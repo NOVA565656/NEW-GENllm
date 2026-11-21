@@ -23,7 +23,8 @@ class AMCPChainClient:
         self.emit_event = emit_event
         self.providers = config.providers
 
-        required = ("groq", "gemini", "nvidia", "cloudflare")
+        # Added "venice" to the required list
+        required = ("groq", "gemini", "nvidia", "cloudflare", "venice")
         missing = [name for name in required if name not in self.providers]
         if missing:
             raise ValueError(f"Missing AMCP chat provider profiles: {', '.join(missing)}")
@@ -34,10 +35,13 @@ class AMCPChainClient:
         }
         self.model = self.clients["groq"].model
 
-        self.phase = "draft"
+        # Added phase initialization and venice tracking
+        self.phase = "init"
+        self.is_venice = False
         self._draft = ""
         self._security_review = ""
         self._bug_review = ""
+        self._venice_draft = ""
 
     def _make_client(self, name: str):
         profile = self.providers[name]
@@ -143,92 +147,161 @@ class AMCPChainClient:
     ) -> LLMResponse:
         del kwargs  # AMCP's normalized client interface does not require extras.
 
-        if self.phase == "draft":
-            # Keep Groq's tool calls in AMCP's normal tool loop. AMCP will execute
-            # them and call this adapter again with the paired tool results.
-            draft_response = await self._stage(
-                "draft",
-                "groq",
-                messages,
-                tools=tools,
-                # Draft text is intermediate; do not stream it to Telegram.
-                stream_callback=None,
-            )
-            if draft_response.tool_calls:
-                return draft_response
+        # --- NEW TURN RESET LOGIC ---
+        # If the last message is from the user, it means we are starting a new request.
+        # This ensures the chain resets properly for follow-up messages in the same session.
+        last_msg_role = messages[-1].get("role") if messages else None
+        if last_msg_role == "user" and self.phase not in ("init", "draft", "venice_nvidia"):
+            self.phase = "init"
+            self.is_venice = False
+            self._draft = ""
+            self._security_review = ""
+            self._bug_review = ""
+            self._venice_draft = ""
 
-            self._draft = draft_response.content or ""
+        # --- ROUTE DETECTION ---
+        if self.phase == "init":
+            # Look for the most recent user message to check for /venice
+            last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+            if isinstance(last_user, str) and last_user.strip().startswith("/venice"):
+                self.is_venice = True
+                self.phase = "venice_nvidia"
+            else:
+                self.is_venice = False
+                self.phase = "draft"
 
-            # Reviewer stages are analysis-only. Tool execution remains with
-            # AMCP and is not delegated to these providers.
-            security_messages = self._append_instruction(
-                messages,
-                "Review this implementation for concrete security issues: "
-                "injection, unsafe permissions, authentication flaws, secret exposure, "
-                "and unsafe handling of untrusted input. Return actionable findings only.\n\n"
-                f"Draft:\n{self._draft}",
-            )
-            security_response = await self._stage(
-                "security_review",
-                "gemini",
-                security_messages,
-            )
-            if security_response.tool_calls:
-                raise RuntimeError("Gemini security reviewer unexpectedly returned tool calls")
-            self._security_review = security_response.content or ""
+        # --- VENICE CHAIN ---
+        if self.is_venice:
+            # Sanitize the /venice command so the AI doesn't get confused
+            sanitized_messages = []
+            for m in messages:
+                if m.get("role") == "user" and isinstance(m.get("content"), str) and "/venice" in m["content"]:
+                    sanitized_messages.append({"role": "user", "content": m["content"].replace("/venice", "").strip()})
+                else:
+                    sanitized_messages.append(m)
 
-            bug_messages = self._append_instruction(
+            responses = []
+
+            # Stage 1: NVIDIA (Analysis)
+            if self.phase == "venice_nvidia":
+                nvidia_messages = self._append_instruction(
+                    sanitized_messages,
+                    "You are an expert debugging assistant. Analyze this request and draft a robust solution, anticipating edge cases.",
+                )
+                nvidia_response = await self._stage(
+                    "venice_nvidia",
+                    "nvidia",
+                    nvidia_messages,
+                )
+                if nvidia_response.tool_calls:
+                    raise RuntimeError("NVIDIA in Venice chain unexpectedly returned tool calls")
+                self._venice_draft = nvidia_response.content or ""
+                responses.append(nvidia_response)
+                self.phase = "venice_final"
+
+            # Stage 2: Venice (Final + Tools)
+            if self.phase == "venice_final":
+                venice_messages = self._append_instruction(
+                    sanitized_messages,
+                    "You are an uncensored coding expert. Produce the final answer. Incorporate the preliminary analysis. Use the supplied tools when needed.\n\n"
+                    f"Preliminary NVIDIA Analysis:\n{self._venice_draft}",
+                )
+                final_response = await self._stage(
+                    "venice_final",
+                    "venice",
+                    venice_messages,
+                    tools=tools,
+                    stream_callback=stream_callback,
+                )
+                responses.append(final_response)
+
+                return LLMResponse(
+                    content=final_response.content,
+                    tool_calls=final_response.tool_calls,
+                    stop_reason=final_response.stop_reason,
+                    thinking=final_response.thinking,
+                    usage=self._combine_usage(responses),
+                )
+
+        # --- STANDARD CHAIN ---
+        else:
+            if self.phase == "draft":
+                # Keep Groq's tool calls in AMCP's normal tool loop.
+                draft_response = await self._stage(
+                    "draft",
+                    "groq",
+                    messages,
+                    tools=tools,
+                    stream_callback=None, # Draft text is intermediate
+                )
+                if draft_response.tool_calls:
+                    return draft_response
+
+                self._draft = draft_response.content or ""
+
+                security_messages = self._append_instruction(
+                    messages,
+                    "Review this implementation for concrete security issues: "
+                    "injection, unsafe permissions, authentication flaws, secret exposure, "
+                    "and unsafe handling of untrusted input. Return actionable findings only.\n\n"
+                    f"Draft:\n{self._draft}",
+                )
+                security_response = await self._stage(
+                    "security_review",
+                    "gemini",
+                    security_messages,
+                )
+                if security_response.tool_calls:
+                    raise RuntimeError("Gemini security reviewer unexpectedly returned tool calls")
+                self._security_review = security_response.content or ""
+
+                bug_messages = self._append_instruction(
+                    messages,
+                    "Find concrete logic bugs, edge cases, concurrency problems, and resource "
+                    "leaks. Return actionable findings only.\n\n"
+                    f"Draft:\n{self._draft}\n\n"
+                    f"Security review:\n{self._security_review}",
+                )
+                bug_response = await self._stage(
+                    "bug_hunt",
+                    "nvidia",
+                    bug_messages,
+                )
+                if bug_response.tool_calls:
+                    raise RuntimeError("NVIDIA bug reviewer unexpectedly returned tool calls")
+                self._bug_review = bug_response.content or ""
+
+                self.phase = "final"
+
+            final_messages = self._append_instruction(
                 messages,
-                "Find concrete logic bugs, edge cases, concurrency problems, and resource "
-                "leaks. Return actionable findings only.\n\n"
+                "Produce the final answer for the user's original request. Incorporate "
+                "valid security and bug-hunt findings. Use the supplied tools when needed. "
+                "Do not claim a tool was used unless AMCP returned its result.\n\n"
                 f"Draft:\n{self._draft}\n\n"
-                f"Security review:\n{self._security_review}",
+                f"Security review:\n{self._security_review}\n\n"
+                f"Bug-hunt review:\n{self._bug_review}",
             )
-            bug_response = await self._stage(
-                "bug_hunt",
-                "nvidia",
-                bug_messages,
+
+            final_response = await self._stage(
+                "final",
+                "cloudflare",
+                final_messages,
+                tools=tools,
+                stream_callback=stream_callback,
             )
-            if bug_response.tool_calls:
-                raise RuntimeError("NVIDIA bug reviewer unexpectedly returned tool calls")
-            self._bug_review = bug_response.content or ""
 
-            self.phase = "final"
+            responses = [final_response]
+            if self.phase == "final" and self._draft:
+                responses.extend([])
 
-        # Rebuild from AMCP's current canonical messages each time. If Cloudflare
-        # requests a tool, AMCP appends the assistant tool call and tool result;
-        # the next call sees those messages and this stage continues normally.
-        final_messages = self._append_instruction(
-            messages,
-            "Produce the final answer for the user's original request. Incorporate "
-            "valid security and bug-hunt findings. Use the supplied tools when needed. "
-            "Do not claim a tool was used unless AMCP returned its result.\n\n"
-            f"Draft:\n{self._draft}\n\n"
-            f"Security review:\n{self._security_review}\n\n"
-            f"Bug-hunt review:\n{self._bug_review}",
-        )
-
-        final_response = await self._stage(
-            "final",
-            "cloudflare",
-            final_messages,
-            tools=tools,
-            stream_callback=stream_callback,
-        )
-
-        # Include usage for the stages performed during this call. Usage from
-        # earlier Groq tool-call rounds was already recorded by AMCP separately.
-        responses = [final_response]
-        if self.phase == "final" and self._draft:
-            responses.extend([])
-
-        return LLMResponse(
-            content=final_response.content,
-            tool_calls=final_response.tool_calls,
-            stop_reason=final_response.stop_reason,
-            thinking=final_response.thinking,
-            usage=self._combine_usage(responses),
-        )
+            return LLMResponse(
+                content=final_response.content,
+                tool_calls=final_response.tool_calls,
+                stop_reason=final_response.stop_reason,
+                thinking=final_response.thinking,
+                usage=self._combine_usage(responses),
+            )
 
     def chat(
         self,
