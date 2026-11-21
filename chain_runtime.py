@@ -55,7 +55,7 @@ class ProviderChain:
         )
         self.gemini_model = os.getenv(
             "GEMINI_MODEL",
-            "gemini-2.5-flash",
+            "gemini-3.8-flash",
         )
         self.nvidia_model = env_required("NVIDIA_MODEL")
         self.cloudflare_model = env_required("CLOUDFLARE_MODEL")
