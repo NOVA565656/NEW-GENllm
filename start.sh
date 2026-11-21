@@ -23,7 +23,7 @@ cat > ~/.config/amcp/config.toml <<EOF
 [chat]
 active_provider = "groq"
 base_url = "https://api.groq.com/openai/v1"
-model = "${GROQ_MODEL:-llama-3.3-70b-versatile}"
+model = "${GROQ_MODEL:-openai/gpt-oss-120b}"
 api_key = "${GROQ_API_KEY}"
 api_type = "openai"
 tool_loop_limit = 300
