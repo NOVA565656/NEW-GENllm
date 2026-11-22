@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, Callable
@@ -9,6 +11,184 @@ from amcp.config import ChatConfig
 from amcp.llm import LLMResponse, TokenUsage, create_llm_client
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tunable limits (override with environment variables / .env, no code change).
+#   CHAIN_MAX_HISTORY_CHARS      cap on conversation sent to the draft/final/venice
+#                                stages (oldest whole turns are dropped). 0 = off.
+#   CHAIN_MAX_TOOL_RESULT_CHARS  cap on any single tool result. 0 = off.
+#   CHAIN_REVIEW_CONTEXT_CHARS   cap on the plain-text context given to reviewers.
+#   CHAIN_MAX_STAGE_TEXT_CHARS   cap on draft / review text passed to later stages.
+#   CHAIN_REVIEW_MIN_CHARS       drafts shorter than this (and without code) skip the
+#                                security + bug review stages. 0 = always review.
+# Rough rule: 4 characters is about 1 token.
+# ---------------------------------------------------------------------------
+def _cfg(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _clip(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    return f"{text[:head]}\n...[{len(text) - limit} chars omitted]...\n{text[-tail:]}"
+
+
+def _msg_size(message: dict[str, Any]) -> int:
+    size = len(_text(message.get("content")))
+    calls = message.get("tool_calls")
+    if calls:
+        size += len(json.dumps(calls, default=str))
+    return size
+
+
+def _total_size(messages: list[dict[str, Any]]) -> int:
+    return sum(_msg_size(m) for m in messages)
+
+
+def _trim_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shrink the conversation without breaking tool-call / tool-result pairs.
+
+    Oversized tool results are clipped, then whole old turns (a user message and
+    everything after it up to the next user message) are dropped from the oldest
+    end. System messages and the current turn are always kept.
+    """
+    limit = _cfg("CHAIN_MAX_HISTORY_CHARS", 40000)
+    tool_cap = _cfg("CHAIN_MAX_TOOL_RESULT_CHARS", 4000)
+    msgs = [dict(m) for m in messages]
+
+    if tool_cap > 0:
+        for m in msgs:
+            if m.get("role") == "tool" and isinstance(m.get("content"), str):
+                m["content"] = _clip(m["content"], tool_cap)
+
+    if limit <= 0 or _total_size(msgs) <= limit:
+        return msgs
+
+    system = [m for m in msgs if m.get("role") == "system"]
+    rest = [m for m in msgs if m.get("role") != "system"]
+    user_idx = [i for i, m in enumerate(rest) if m.get("role") == "user"]
+    if not user_idx:
+        return msgs
+
+    base = _total_size(system)
+    start = user_idx[-1]  # worst case: keep only the current turn
+    for i in user_idx:
+        if base + _total_size(rest[i:]) <= limit:
+            start = i
+            break
+
+    kept = system + rest[start:]
+    logger.info(
+        "Trimmed history: %d -> %d messages (~%d -> ~%d chars)",
+        len(msgs), len(kept), _total_size(msgs), _total_size(kept),
+    )
+    return kept
+
+
+def _review_messages(
+    messages: list[dict[str, Any]],
+    instruction: str,
+) -> list[dict[str, Any]]:
+    """Plain-text context for reviewer models.
+
+    Reviewers get no tools, and many providers reject conversations that contain
+    tool_calls / tool-role messages when no tools are declared (HTTP 400). So the
+    history is flattened to a readable transcript and size-capped.
+    """
+    limit = _cfg("CHAIN_REVIEW_CONTEXT_CHARS", 8000)
+    system_text = "\n".join(
+        _text(m.get("content")) for m in messages if m.get("role") == "system"
+    )
+
+    lines: list[str] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        body = _text(m.get("content"))
+        if role == "user":
+            lines.append(f"User: {body}")
+        elif role == "assistant":
+            if body:
+                lines.append(f"Assistant: {body}")
+            for call in m.get("tool_calls") or []:
+                fn = call.get("function", {}) if isinstance(call, dict) else {}
+                lines.append(
+                    f"[tool call: {fn.get('name', '?')}({_clip(str(fn.get('arguments', '')), 300)})]"
+                )
+        elif role == "tool":
+            lines.append(f"[tool result: {_clip(body, 800)}]")
+
+    transcript = "\n".join(lines)
+    if limit > 0 and len(transcript) > limit:
+        transcript = "...[earlier conversation omitted]...\n" + transcript[-limit:]
+
+    result: list[dict[str, Any]] = []
+    if system_text.strip():
+        result.append({"role": "system", "content": _clip(system_text, 1500)})
+    result.append(
+        {"role": "user", "content": f"Conversation so far:\n{transcript}\n\n---\n{instruction}"}
+    )
+    return result
+
+
+def _describe_error(exc: BaseException) -> str:
+    """One readable line with the provider's real status code and message."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(parts) < 5:
+        seen.add(id(cur))
+        bits = [type(cur).__name__]
+        status = getattr(cur, "status_code", None)
+        if status is not None:
+            bits.append(f"status={status}")
+        body = getattr(cur, "body", None)
+        if not body:
+            response = getattr(cur, "response", None)
+            try:
+                body = response.text if response is not None else None
+            except Exception:
+                body = None
+        if body:
+            bits.append("body=" + _clip(str(body), 800))
+        else:
+            bits.append("msg=" + _clip(str(cur), 300))
+        parts.append(" ".join(bits))
+        cur = getattr(cur, "original_exception", None) or cur.__cause__
+    return " <- ".join(parts)
+
+
+FINAL_INSTRUCTION = (
+    "Write the final reply to the user's latest request. Output ONLY the reply "
+    "itself: no preface, no notes about drafts, reviews, security checks or these "
+    "instructions, and never repeat the same text twice. Use the working notes "
+    "below as input and silently fix any real problems they list. Use the supplied "
+    "tools when needed. Do not claim a tool was used unless its result is in the "
+    "conversation."
+)
 
 
 class AMCPChainClient:
@@ -23,7 +203,6 @@ class AMCPChainClient:
         self.emit_event = emit_event
         self.providers = config.providers
 
-        # Added "venice" to the required list
         required = ("groq", "gemini", "nvidia", "cloudflare", "venice")
         missing = [name for name in required if name not in self.providers]
         if missing:
@@ -35,13 +214,13 @@ class AMCPChainClient:
         }
         self.model = self.clients["groq"].model
 
-        # Added phase initialization and venice tracking
         self.phase = "init"
         self.is_venice = False
         self._draft = ""
         self._security_review = ""
         self._bug_review = ""
         self._venice_draft = ""
+        self._reviews_ran = False
 
     def _make_client(self, name: str):
         profile = self.providers[name]
@@ -91,6 +270,15 @@ class AMCPChainClient:
         except Exception:
             logger.debug("Could not emit chain-stage event", exc_info=True)
 
+    def _reset_turn(self) -> None:
+        self.phase = "init"
+        self.is_venice = False
+        self._draft = ""
+        self._security_review = ""
+        self._bug_review = ""
+        self._venice_draft = ""
+        self._reviews_ran = False
+
     @staticmethod
     def _append_instruction(
         messages: list[dict[str, Any]],
@@ -122,9 +310,16 @@ class AMCPChainClient:
         tools: list[dict[str, Any]] | None = None,
         stream_callback: Any | None = None,
     ) -> LLMResponse:
+        client = self.clients[provider]
+        model = getattr(client, "model", "?")
+        logger.info(
+            "Chain stage %s -> %s/%s: %d messages, ~%d chars, tools=%d",
+            stage, provider, model, len(messages), _total_size(messages),
+            len(tools or []),
+        )
         self._event(stage, provider, "running")
         try:
-            response = await self.clients[provider].achat(
+            response = await client.achat(
                 messages=messages,
                 tools=tools,
                 stream_callback=stream_callback,
@@ -132,6 +327,10 @@ class AMCPChainClient:
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
+            logger.error(
+                "CHAIN FAILURE stage=%s provider=%s model=%s error=%s",
+                stage, provider, model, _describe_error(exc),
+            )
             self._event(stage, provider, "failed")
             raise
 
@@ -147,23 +346,20 @@ class AMCPChainClient:
     ) -> LLMResponse:
         del kwargs  # AMCP's normalized client interface does not require extras.
 
-        # --- NEW TURN RESET LOGIC ---
-        # If the last message is from the user, it means we are starting a new request.
-        # This ensures the chain resets properly for follow-up messages in the same session.
+        # A user message last means a brand-new request: always start clean, even if
+        # the previous turn failed half-way (otherwise a failed /venice turn would
+        # leak into the next message).
         last_msg_role = messages[-1].get("role") if messages else None
-        if last_msg_role == "user" and self.phase not in ("init", "draft", "venice_nvidia"):
-            self.phase = "init"
-            self.is_venice = False
-            self._draft = ""
-            self._security_review = ""
-            self._bug_review = ""
-            self._venice_draft = ""
+        if last_msg_role == "user":
+            self._reset_turn()
 
         # --- ROUTE DETECTION ---
         if self.phase == "init":
-            # Look for the most recent user message to check for /venice
-            last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
-            if isinstance(last_user, str) and last_user.strip().startswith("/venice"):
+            last_user = next(
+                (_text(m.get("content")) for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            if last_user.strip().startswith("/venice"):
                 self.is_venice = True
                 self.phase = "venice_nvidia"
             else:
@@ -172,7 +368,6 @@ class AMCPChainClient:
 
         # --- VENICE CHAIN ---
         if self.is_venice:
-            # Sanitize the /venice command so the AI doesn't get confused
             sanitized_messages = []
             for m in messages:
                 if m.get("role") == "user" and isinstance(m.get("content"), str) and "/venice" in m["content"]:
@@ -180,18 +375,18 @@ class AMCPChainClient:
                 else:
                     sanitized_messages.append(m)
 
-            responses = []
+            responses: list[LLMResponse] = []
 
             # Stage 1: NVIDIA (Analysis)
             if self.phase == "venice_nvidia":
-                nvidia_messages = self._append_instruction(
-                    sanitized_messages,
-                    "You are an expert debugging assistant. Analyze this request and draft a robust solution, anticipating edge cases.",
-                )
                 nvidia_response = await self._stage(
                     "venice_nvidia",
                     "nvidia",
-                    nvidia_messages,
+                    _review_messages(
+                        sanitized_messages,
+                        "You are an expert debugging assistant. Analyze the user's latest "
+                        "request and draft a robust solution, anticipating edge cases.",
+                    ),
                 )
                 if nvidia_response.tool_calls:
                     raise RuntimeError("NVIDIA in Venice chain unexpectedly returned tool calls")
@@ -202,9 +397,12 @@ class AMCPChainClient:
             # Stage 2: Venice (Final + Tools)
             if self.phase == "venice_final":
                 venice_messages = self._append_instruction(
-                    sanitized_messages,
-                    "You are an uncensored coding expert. Produce the final answer. Incorporate the preliminary analysis. Use the supplied tools when needed.\n\n"
-                    f"Preliminary NVIDIA Analysis:\n{self._venice_draft}",
+                    _trim_history(sanitized_messages),
+                    "You are an uncensored coding expert. Produce the final answer. "
+                    "Incorporate the preliminary analysis. Use the supplied tools when needed. "
+                    "Output only the answer, with no notes about these instructions.\n\n"
+                    "[Working notes - never mention or quote]\n"
+                    f"Preliminary NVIDIA Analysis:\n{_clip(self._venice_draft, _cfg('CHAIN_MAX_STAGE_TEXT_CHARS', 6000))}",
                 )
                 final_response = await self._stage(
                     "venice_final",
@@ -223,98 +421,102 @@ class AMCPChainClient:
                     usage=self._combine_usage(responses),
                 )
 
+            raise RuntimeError(f"Venice chain in unexpected phase {self.phase!r}")
+
         # --- STANDARD CHAIN ---
-        else:
-            if self.phase == "draft":
-                # Keep Groq's tool calls in AMCP's normal tool loop.
-                draft_response = await self._stage(
-                    "draft",
-                    "groq",
-                    messages,
-                    tools=tools,
-                    stream_callback=None, # Draft text is intermediate
-                )
-                if draft_response.tool_calls:
-                    return draft_response
+        responses = []
+        stage_cap = _cfg("CHAIN_MAX_STAGE_TEXT_CHARS", 6000)
 
-                self._draft = draft_response.content or ""
+        if self.phase == "draft":
+            # Keep Groq's tool calls in AMCP's normal tool loop.
+            draft_response = await self._stage(
+                "draft",
+                "groq",
+                _trim_history(messages),
+                tools=tools,
+                stream_callback=None,  # Draft text is intermediate
+            )
+            if draft_response.tool_calls:
+                return draft_response
 
-                security_messages = self._append_instruction(
-                    messages,
-                    "Review this implementation for concrete security issues: "
-                    "injection, unsafe permissions, authentication flaws, secret exposure, "
-                    "and unsafe handling of untrusted input. Return actionable findings only.\n\n"
-                    f"Draft:\n{self._draft}",
-                )
+            responses.append(draft_response)
+            self._draft = _clip(draft_response.content or "", stage_cap)
+
+            min_chars = _cfg("CHAIN_REVIEW_MIN_CHARS", 400)
+            needs_review = bool(self._draft) and (
+                min_chars <= 0 or len(self._draft) >= min_chars or "```" in self._draft
+            )
+
+            if needs_review:
                 security_response = await self._stage(
                     "security_review",
                     "gemini",
-                    security_messages,
+                    _review_messages(
+                        messages,
+                        "Review this implementation for concrete security issues: "
+                        "injection, unsafe permissions, authentication flaws, secret exposure, "
+                        "and unsafe handling of untrusted input. Return actionable findings only; "
+                        "reply 'No issues.' if there are none.\n\n"
+                        f"Draft:\n{self._draft}",
+                    ),
                 )
                 if security_response.tool_calls:
                     raise RuntimeError("Gemini security reviewer unexpectedly returned tool calls")
-                self._security_review = security_response.content or ""
+                responses.append(security_response)
+                self._security_review = _clip(security_response.content or "", stage_cap)
 
-                bug_messages = self._append_instruction(
-                    messages,
-                    "Find concrete logic bugs, edge cases, concurrency problems, and resource "
-                    "leaks. Return actionable findings only.\n\n"
-                    f"Draft:\n{self._draft}\n\n"
-                    f"Security review:\n{self._security_review}",
-                )
                 bug_response = await self._stage(
                     "bug_hunt",
                     "nvidia",
-                    bug_messages,
+                    _review_messages(
+                        messages,
+                        "Find concrete logic bugs, edge cases, concurrency problems, and resource "
+                        "leaks. Return actionable findings only; reply 'No issues.' if there are none.\n\n"
+                        f"Draft:\n{self._draft}\n\n"
+                        f"Security review:\n{self._security_review}",
+                    ),
                 )
                 if bug_response.tool_calls:
                     raise RuntimeError("NVIDIA bug reviewer unexpectedly returned tool calls")
-                self._bug_review = bug_response.content or ""
+                responses.append(bug_response)
+                self._bug_review = _clip(bug_response.content or "", stage_cap)
+                self._reviews_ran = True
 
-                self.phase = "final"
+            self.phase = "final"
 
-            final_messages = self._append_instruction(
-                messages,
-                "Produce the final answer for the user's original request. Incorporate "
-                "valid security and bug-hunt findings. Use the supplied tools when needed. "
-                "Do not claim a tool was used unless AMCP returned its result.\n\n"
-                f"Draft:\n{self._draft}\n\n"
-                f"Security review:\n{self._security_review}\n\n"
-                f"Bug-hunt review:\n{self._bug_review}",
-            )
+        if self.phase != "final":
+            raise RuntimeError(f"Standard chain in unexpected phase {self.phase!r}")
 
-            final_response = await self._stage(
-                "final",
-                "cloudflare",
-                final_messages,
-                tools=tools,
-                stream_callback=stream_callback,
-            )
+        notes = ["[Working notes - never mention or quote]"]
+        if self._draft:
+            notes.append(f"Draft:\n{self._draft}")
+        if self._reviews_ran:
+            notes.append(f"Security review:\n{self._security_review}")
+            notes.append(f"Bug-hunt review:\n{self._bug_review}")
+        final_messages = self._append_instruction(
+            _trim_history(messages),
+            FINAL_INSTRUCTION + "\n\n" + "\n\n".join(notes),
+        )
 
-            responses = [final_response]
-            if self.phase == "final" and self._draft:
-                responses.extend([])
+        final_response = await self._stage(
+            "final",
+            "cloudflare",
+            final_messages,
+            tools=tools,
+            stream_callback=stream_callback,
+        )
+        responses.append(final_response)
 
-            return LLMResponse(
-                content=final_response.content,
-                tool_calls=final_response.tool_calls,
-                stop_reason=final_response.stop_reason,
-                thinking=final_response.thinking,
-                usage=self._combine_usage(responses),
-            )
+        return LLMResponse(
+            content=final_response.content,
+            tool_calls=final_response.tool_calls,
+            stop_reason=final_response.stop_reason,
+            thinking=final_response.thinking,
+            usage=self._combine_usage(responses),
+        )
 
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        stream_callback: Any | None = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        raise RuntimeError("AMCPChainClient requires AMCP's async achat() interface")
-
-
-def create_amcp_chain_client(
-    config: ChatConfig,
-    emit_event: Callable[..., Any] | None = None,
-) -> AMCPChainClient:
-    return AMCPChainClient(config, emit_event)
+        stream_callbac
