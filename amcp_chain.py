@@ -519,4 +519,14 @@ class AMCPChainClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        stream_callbac
+        stream_callback: Any | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        raise RuntimeError("AMCPChainClient requires AMCP's async achat() interface")
+
+
+def create_amcp_chain_client(
+    config: ChatConfig,
+    emit_event: Callable[..., Any] | None = None,
+) -> AMCPChainClient:
+    return AMCPChainClient(config, emit_event)
