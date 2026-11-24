@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 #   CHAIN_MAX_STAGE_TEXT_CHARS   cap on draft / review text passed to later stages.
 #   CHAIN_REVIEW_MIN_CHARS       drafts shorter than this (and without code) skip the
 #                                security + bug review stages. 0 = always review.
+#   CHAIN_DRAFT_PROVIDER         who writes the draft (and may use tools). Default gemini.
+#   CHAIN_SECURITY_PROVIDER      security reviewer. Default nvidia.
+#   CHAIN_BUG_PROVIDER           bug-hunt reviewer. Default groq.
+#   CHAIN_FINAL_PROVIDER         final answer (and tools). Default cloudflare.
+#   Each must be one of: groq, gemini, nvidia, cloudflare, venice.
 # Rough rule: 4 characters is about 1 token.
 # ---------------------------------------------------------------------------
 def _cfg(name: str, default: int) -> int:
@@ -29,6 +35,10 @@ def _cfg(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _provider(env_name: str, default: str) -> str:
+    return (os.environ.get(env_name) or default).strip().lower()
 
 
 def _text(content: Any) -> str:
@@ -212,7 +222,19 @@ class AMCPChainClient:
             name: self._make_client(name)
             for name in required
         }
-        self.model = self.clients["groq"].model
+        self.stage_providers = {
+            "draft": _provider("CHAIN_DRAFT_PROVIDER", "gemini"),
+            "security": _provider("CHAIN_SECURITY_PROVIDER", "nvidia"),
+            "bug": _provider("CHAIN_BUG_PROVIDER", "groq"),
+            "final": _provider("CHAIN_FINAL_PROVIDER", "cloudflare"),
+        }
+        for role, name in self.stage_providers.items():
+            if name not in self.clients:
+                raise ValueError(
+                    f"CHAIN_{role.upper()}_PROVIDER={name!r} is not one of {', '.join(required)}"
+                )
+        self.model = self.clients[self.stage_providers["draft"]].model
+        logger.info("Chain stage providers: %s", self.stage_providers)
 
         self.phase = "init"
         self.is_venice = False
@@ -431,7 +453,7 @@ class AMCPChainClient:
             # Keep Groq's tool calls in AMCP's normal tool loop.
             draft_response = await self._stage(
                 "draft",
-                "groq",
+                self.stage_providers["draft"],
                 _trim_history(messages),
                 tools=tools,
                 stream_callback=None,  # Draft text is intermediate
@@ -450,7 +472,7 @@ class AMCPChainClient:
             if needs_review:
                 security_response = await self._stage(
                     "security_review",
-                    "gemini",
+                    self.stage_providers["security"],
                     _review_messages(
                         messages,
                         "Review this implementation for concrete security issues: "
@@ -461,13 +483,13 @@ class AMCPChainClient:
                     ),
                 )
                 if security_response.tool_calls:
-                    raise RuntimeError("Gemini security reviewer unexpectedly returned tool calls")
+                    raise RuntimeError("Security reviewer unexpectedly returned tool calls")
                 responses.append(security_response)
                 self._security_review = _clip(security_response.content or "", stage_cap)
 
                 bug_response = await self._stage(
                     "bug_hunt",
-                    "nvidia",
+                    self.stage_providers["bug"],
                     _review_messages(
                         messages,
                         "Find concrete logic bugs, edge cases, concurrency problems, and resource "
@@ -477,7 +499,7 @@ class AMCPChainClient:
                     ),
                 )
                 if bug_response.tool_calls:
-                    raise RuntimeError("NVIDIA bug reviewer unexpectedly returned tool calls")
+                    raise RuntimeError("Bug reviewer unexpectedly returned tool calls")
                 responses.append(bug_response)
                 self._bug_review = _clip(bug_response.content or "", stage_cap)
                 self._reviews_ran = True
@@ -500,7 +522,7 @@ class AMCPChainClient:
 
         final_response = await self._stage(
             "final",
-            "cloudflare",
+            self.stage_providers["final"],
             final_messages,
             tools=tools,
             stream_callback=stream_callback,
