@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 #   CHAIN_SKIP_FINAL_WHEN_NO_REVIEW  1 (default): when the draft is short and has no code, the
 #                                draft IS the answer (1 model call instead of 2). 0 = always
 #                                run the final stage.
+#   CHAIN_LOG_STAGES             1 = print one "CHAIN CALL ..." line per model call (size of the
+#                                messages and of the tool definitions). Default 0.
 #   Reviewers (security, bug) are best-effort: if one fails, the answer is still
 #   produced without that review instead of the whole message failing.
 # Rough rule: 4 characters is about 1 token.
@@ -427,10 +429,12 @@ class AMCPChainClient:
         model = getattr(client, "model", "?")
         if provider == "gemini":
             messages = _with_gemini_signatures(messages)
-        logger.info(
-            "Chain stage %s -> %s/%s: %d messages, ~%d chars, tools=%d",
+        tool_chars = len(json.dumps(tools, default=str)) if tools else 0
+        logger.log(
+            logging.WARNING if _cfg("CHAIN_LOG_STAGES", 0) else logging.INFO,
+            "CHAIN CALL stage=%s provider=%s model=%s messages=%d chars=%d tools=%d tool_chars=%d",
             stage, provider, model, len(messages), _total_size(messages),
-            len(tools or []),
+            len(tools or []), tool_chars,
         )
         self._event(stage, provider, "running")
         try:
