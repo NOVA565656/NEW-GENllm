@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -28,6 +27,11 @@ logger = logging.getLogger(__name__)
 #   CHAIN_BUG_PROVIDER           bug-hunt reviewer. Default groq.
 #   CHAIN_FINAL_PROVIDER         final answer (and tools). Default cloudflare.
 #   Each must be one of: groq, gemini, nvidia, cloudflare, venice.
+#   CHAIN_DRAFT_FALLBACK         used once if the draft provider fails with a temporary
+#                                error (429/5xx/413/timeout). Default nvidia. Empty = off.
+#   CHAIN_FINAL_FALLBACK         same, for the final stage. Default gemini. Empty = off.
+#   Reviewers (security, bug) are best-effort: if one fails, the answer is still
+#   produced without that review instead of the whole message failing.
 # Rough rule: 4 characters is about 1 token.
 # ---------------------------------------------------------------------------
 def _cfg(name: str, default: int) -> int:
@@ -38,7 +42,8 @@ def _cfg(name: str, default: int) -> int:
 
 
 def _provider(env_name: str, default: str) -> str:
-    return (os.environ.get(env_name) or default).strip().lower()
+    raw = os.environ.get(env_name)
+    return (default if raw is None else raw).strip().lower()
 
 
 def _text(content: Any) -> str:
@@ -155,11 +160,16 @@ def _review_messages(
     if limit > 0 and len(transcript) > limit:
         transcript = "...[earlier conversation omitted]...\n" + transcript[-limit:]
 
-    result: list[dict[str, Any]] = []
+    result: list[dict[str, Any]] = [{"role": "system", "content": NO_TOOLS_NOTE}]
     if system_text.strip():
         result.append({"role": "system", "content": _clip(system_text, 1500)})
     result.append(
-        {"role": "user", "content": f"Conversation so far:\n{transcript}\n\n---\n{instruction}"}
+        {
+            "role": "user",
+            "content": (
+                f"Conversation so far:\n{transcript}\n\n---\n{instruction}"
+            ),
+        }
     )
     return result
 
@@ -190,6 +200,31 @@ def _describe_error(exc: BaseException) -> str:
         cur = getattr(cur, "original_exception", None) or cur.__cause__
     return " <- ".join(parts)
 
+
+_TRANSIENT_STATUS = {408, 409, 413, 425, 429, 500, 502, 503, 504, 529}
+_TRANSIENT_NAMES = ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable", "overloaded")
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for errors where trying a different provider can reasonably help."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(cur, "status_code", None)
+        if isinstance(status, int):
+            return status in _TRANSIENT_STATUS
+        name = type(cur).__name__.lower()
+        if any(tag in name for tag in _TRANSIENT_NAMES):
+            return True
+        cur = getattr(cur, "original_exception", None) or cur.__cause__
+    return False
+
+
+NO_TOOLS_NOTE = (
+    "You have NO tools in this conversation. Never call a tool or function and never "
+    "emit tool-call syntax. Answer in plain text only."
+)
 
 FINAL_INSTRUCTION = (
     "Write the final reply to the user's latest request. Output ONLY the reply "
@@ -233,6 +268,17 @@ class AMCPChainClient:
                 raise ValueError(
                     f"CHAIN_{role.upper()}_PROVIDER={name!r} is not one of {', '.join(required)}"
                 )
+        self.fallbacks = {
+            "draft": _provider("CHAIN_DRAFT_FALLBACK", "nvidia"),
+            "final": _provider("CHAIN_FINAL_FALLBACK", "gemini"),
+        }
+        for role, name in list(self.fallbacks.items()):
+            if name and name not in self.clients:
+                raise ValueError(
+                    f"CHAIN_{role.upper()}_FALLBACK={name!r} is not one of {', '.join(required)}"
+                )
+            if name == self.stage_providers[role]:
+                self.fallbacks[role] = ""
         self.model = self.clients[self.stage_providers["draft"]].model
         logger.info("Chain stage providers: %s", self.stage_providers)
 
@@ -359,6 +405,50 @@ class AMCPChainClient:
         self._event(stage, provider, "complete")
         return response
 
+    async def _stage_with_fallback(
+        self,
+        stage: str,
+        role: str,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        stream_callback: Any | None = None,
+    ) -> LLMResponse:
+        primary = self.stage_providers[role]
+        try:
+            return await self._stage(
+                stage, primary, messages, tools=tools, stream_callback=stream_callback
+            )
+        except Exception as exc:  # CancelledError is BaseException and is not caught
+            backup = self.fallbacks.get(role, "")
+            if not backup or not _is_transient(exc):
+                raise
+            logger.warning(
+                "Stage %s: %s failed with a temporary error, retrying once on %s",
+                stage, primary, backup,
+            )
+            return await self._stage(
+                f"{stage}_fallback", backup, messages,
+                tools=tools, stream_callback=stream_callback,
+            )
+
+    async def _review_stage(
+        self,
+        stage: str,
+        role: str,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """Best-effort reviewer: never lets a review failure kill the user's answer."""
+        try:
+            response = await self._stage(stage, self.stage_providers[role], messages)
+        except Exception as exc:
+            logger.warning("Review stage %s skipped after failure: %s", stage, type(exc).__name__)
+            return ""
+        if response.tool_calls:
+            logger.warning("Review stage %s returned tool calls; ignoring them", stage)
+            return ""
+        return response.content or ""
+
     async def achat(
         self,
         messages: list[dict[str, Any]],
@@ -451,12 +541,8 @@ class AMCPChainClient:
 
         if self.phase == "draft":
             # Keep Groq's tool calls in AMCP's normal tool loop.
-            draft_response = await self._stage(
-                "draft",
-                self.stage_providers["draft"],
-                _trim_history(messages),
-                tools=tools,
-                stream_callback=None,  # Draft text is intermediate
+            draft_response = await self._stage_with_fallback(
+                "draft", "draft", _trim_history(messages), tools=tools
             )
             if draft_response.tool_calls:
                 return draft_response
@@ -470,9 +556,9 @@ class AMCPChainClient:
             )
 
             if needs_review:
-                security_response = await self._stage(
+                self._security_review = _clip(await self._review_stage(
                     "security_review",
-                    self.stage_providers["security"],
+                    "security",
                     _review_messages(
                         messages,
                         "Review this implementation for concrete security issues: "
@@ -481,28 +567,22 @@ class AMCPChainClient:
                         "reply 'No issues.' if there are none.\n\n"
                         f"Draft:\n{self._draft}",
                     ),
-                )
-                if security_response.tool_calls:
-                    raise RuntimeError("Security reviewer unexpectedly returned tool calls")
-                responses.append(security_response)
-                self._security_review = _clip(security_response.content or "", stage_cap)
+                ), stage_cap)
 
-                bug_response = await self._stage(
+                security_note = (
+                    f"\n\nSecurity review:\n{self._security_review}" if self._security_review else ""
+                )
+                self._bug_review = _clip(await self._review_stage(
                     "bug_hunt",
-                    self.stage_providers["bug"],
+                    "bug",
                     _review_messages(
                         messages,
                         "Find concrete logic bugs, edge cases, concurrency problems, and resource "
                         "leaks. Return actionable findings only; reply 'No issues.' if there are none.\n\n"
-                        f"Draft:\n{self._draft}\n\n"
-                        f"Security review:\n{self._security_review}",
+                        f"Draft:\n{self._draft}{security_note}",
                     ),
-                )
-                if bug_response.tool_calls:
-                    raise RuntimeError("Bug reviewer unexpectedly returned tool calls")
-                responses.append(bug_response)
-                self._bug_review = _clip(bug_response.content or "", stage_cap)
-                self._reviews_ran = True
+                ), stage_cap)
+                self._reviews_ran = bool(self._security_review or self._bug_review)
 
             self.phase = "final"
 
@@ -512,20 +592,18 @@ class AMCPChainClient:
         notes = ["[Working notes - never mention or quote]"]
         if self._draft:
             notes.append(f"Draft:\n{self._draft}")
-        if self._reviews_ran:
+        if self._security_review:
             notes.append(f"Security review:\n{self._security_review}")
+        if self._bug_review:
             notes.append(f"Bug-hunt review:\n{self._bug_review}")
         final_messages = self._append_instruction(
             _trim_history(messages),
             FINAL_INSTRUCTION + "\n\n" + "\n\n".join(notes),
         )
 
-        final_response = await self._stage(
-            "final",
-            self.stage_providers["final"],
-            final_messages,
-            tools=tools,
-            stream_callback=stream_callback,
+        final_response = await self._stage_with_fallback(
+            "final", "final", final_messages,
+            tools=tools, stream_callback=stream_callback,
         )
         responses.append(final_response)
 
