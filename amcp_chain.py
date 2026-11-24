@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 #   CHAIN_FINAL_PROVIDER         final answer (and tools). Default cloudflare.
 #   Each must be one of: groq, gemini, nvidia, cloudflare, venice.
 #   CHAIN_DRAFT_FALLBACK         used once if the draft provider fails with a temporary
-#                                error (429/5xx/413/timeout). Default nvidia. Empty = off.
+#                                error (429/5xx/413/timeout, or Gemini's thought_signature 400). Default
+#                                cloudflare. Empty = off.
 #   CHAIN_FINAL_FALLBACK         same, for the final stage. Default gemini. Empty = off.
 #   Reviewers (security, bug) are best-effort: if one fails, the answer is still
 #   produced without that review instead of the whole message failing.
@@ -201,12 +202,53 @@ def _describe_error(exc: BaseException) -> str:
     return " <- ".join(parts)
 
 
+# Gemini 3 models return a "thought signature" with every tool call and answer HTTP 400
+# ("Function call is missing a thought_signature") if the history sent back lacks it.
+# Other providers never produce one, and AMCP may not keep it, so before a request goes to
+# Gemini we add Google's documented skip value to any tool call that has none.
+_GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def _with_gemini_signatures(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not any(m.get("role") == "assistant" and m.get("tool_calls") for m in messages):
+        return messages
+    patched: list[dict[str, Any]] = []
+    for m in messages:
+        calls = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if not calls:
+            patched.append(m)
+            continue
+        new_calls = []
+        for call in calls:
+            if not isinstance(call, dict):
+                new_calls.append(call)
+                continue
+            extra = call.get("extra_content")
+            google = extra.get("google") if isinstance(extra, dict) else None
+            if isinstance(google, dict) and google.get("thought_signature"):
+                new_calls.append(call)
+                continue
+            call = dict(call)
+            call["extra_content"] = {"google": {"thought_signature": _GEMINI_SKIP_SIGNATURE}}
+            new_calls.append(call)
+        m = dict(m)
+        m["tool_calls"] = new_calls
+        patched.append(m)
+    return patched
+
+
+def _is_signature_error(exc: BaseException) -> bool:
+    return "thought_signature" in _describe_error(exc).lower()
+
+
 _TRANSIENT_STATUS = {408, 409, 413, 425, 429, 500, 502, 503, 504, 529}
 _TRANSIENT_NAMES = ("timeout", "connection", "ratelimit", "internalserver", "serviceunavailable", "overloaded")
 
 
 def _is_transient(exc: BaseException) -> bool:
     """True for errors where trying a different provider can reasonably help."""
+    if _is_signature_error(exc):
+        return True
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
@@ -269,7 +311,7 @@ class AMCPChainClient:
                     f"CHAIN_{role.upper()}_PROVIDER={name!r} is not one of {', '.join(required)}"
                 )
         self.fallbacks = {
-            "draft": _provider("CHAIN_DRAFT_FALLBACK", "nvidia"),
+            "draft": _provider("CHAIN_DRAFT_FALLBACK", "cloudflare"),
             "final": _provider("CHAIN_FINAL_FALLBACK", "gemini"),
         }
         for role, name in list(self.fallbacks.items()):
@@ -380,6 +422,8 @@ class AMCPChainClient:
     ) -> LLMResponse:
         client = self.clients[provider]
         model = getattr(client, "model", "?")
+        if provider == "gemini":
+            messages = _with_gemini_signatures(messages)
         logger.info(
             "Chain stage %s -> %s/%s: %d messages, ~%d chars, tools=%d",
             stage, provider, model, len(messages), _total_size(messages),
