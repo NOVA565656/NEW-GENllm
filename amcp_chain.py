@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 #                                error (429/5xx/413/timeout, or Gemini's thought_signature 400). Default
 #                                cloudflare. Empty = off.
 #   CHAIN_FINAL_FALLBACK         same, for the final stage. Default gemini. Empty = off.
+#   CHAIN_SKIP_FINAL_WHEN_NO_REVIEW  1 (default): when the draft is short and has no code, the
+#                                draft IS the answer (1 model call instead of 2). 0 = always
+#                                run the final stage.
 #   Reviewers (security, bug) are best-effort: if one fails, the answer is still
 #   produced without that review instead of the whole message failing.
 # Rough rule: 4 characters is about 1 token.
@@ -598,6 +601,21 @@ class AMCPChainClient:
             needs_review = bool(self._draft) and (
                 min_chars <= 0 or len(self._draft) >= min_chars or "```" in self._draft
             )
+
+            if (
+                not needs_review
+                and self._draft
+                and _cfg("CHAIN_SKIP_FINAL_WHEN_NO_REVIEW", 1)
+            ):
+                # Simple reply: no reviews were needed, so a second "final" call would only
+                # rewrite the same text. Return the draft and save a call (and quota).
+                return LLMResponse(
+                    content=draft_response.content,
+                    tool_calls=None,
+                    stop_reason=draft_response.stop_reason,
+                    thinking=draft_response.thinking,
+                    usage=self._combine_usage(responses),
+                )
 
             if needs_review:
                 self._security_review = _clip(await self._review_stage(
