@@ -320,11 +320,19 @@ SYS_WRITER = ("You are a careful senior engineer. Write complete, working, secur
               "Always output the FULL content of every file you touch, never partial snippets.")
 
 
-def extract_json(text):
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        raise ValueError("no JSON object found")
-    return json.loads(m.group(0))
+def extract_json(text, need=None):
+    """Find the first JSON object in text (ignores <think> blocks and prose around it).
+    If `need` is given, the object must contain that key."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and (need is None or need in obj):
+            return obj
+    raise ValueError("no JSON object found")
 
 
 def cmd_plan(idea):
@@ -340,7 +348,7 @@ def cmd_plan(idea):
     text = call_model("plan", [{"role": "system", "content": "You are a pragmatic software architect."},
                                {"role": "user", "content": prompt}], 6000)
     try:
-        plan = extract_json(text)
+        plan = extract_json(text, "milestones")
         assert plan["milestones"] and plan["test_cmd"]
     except Exception as e:
         sys.exit("Planner returned something unusable (%s). Run plan again." % e)
@@ -436,13 +444,16 @@ def build_milestone(st, m):
               "validation) and real BUGS. Ignore style. Reply with ONLY JSON: "
               '{"issues":[{"severity":"high|medium|low","file":"...","problem":"...","fix":"..."}]}'
               " (empty list if none).\n\nDIFF:\n%s") % diff
-        try:
-            rv = extract_json(call_model("review", [{"role": "system", "content": "You are a strict code reviewer."},
-                                                    {"role": "user", "content": rp}], 3000))
-            issues = rv.get("issues", [])
-        except Exception as e:
-            log("review unusable (%s); skipped" % str(e)[:80])
-            issues = []
+        issues = []
+        for tryno in range(2):
+            ask = rp if tryno == 0 else rp + "\n\nIMPORTANT: reply with ONLY the JSON object, no other text."
+            try:
+                rv = extract_json(call_model("review", [{"role": "system", "content": "You are a strict code reviewer."},
+                                                        {"role": "user", "content": ask}], 3000), "issues")
+                issues = rv.get("issues", []) or []
+                break
+            except Exception as e:
+                log("review unusable (%s)%s" % (str(e)[:80], "; retrying" if tryno == 0 else "; skipped"))
         serious = [i for i in issues if str(i.get("severity", "")).lower() in ("high", "medium")]
         with open("REVIEW.md", "a") as f:
             f.write("\n## Milestone %d: %s\n" % (m["id"], m["title"]))
