@@ -24,19 +24,19 @@ LOCK = threading.Lock()
 JOB = None          # {"name","proc","kind","chat"}
 
 COMMANDS = [
-    ("new", "new <name> <idea> - make a plan for a new project"),
-    ("plan", "show the current project's plan"),
-    ("build", "build all pending milestones"),
-    ("status", "milestone status + whether a job is running"),
-    ("log", "last lines of the build log"),
-    ("review", "what the reviewer found"),
-    ("stop", "stop the running job (progress is saved)"),
-    ("projects", "list projects"),
-    ("use", "use <name> - switch project"),
-    ("remote", "remote <https github url> - set where to push"),
-    ("push", "push the project to GitHub"),
-    ("replan", "redo the plan (only before any milestone is built)"),
-    ("help", "show commands"),
+    ("new", "Plan a new project: /new <name> <idea>"),
+    ("plan", "Show the current project's plan"),
+    ("build", "Build all pending milestones"),
+    ("status", "Milestone status and whether a job is running"),
+    ("log", "Last lines of the build log"),
+    ("review", "What the reviewer found"),
+    ("stop", "Stop the running job (progress is saved)"),
+    ("projects", "List projects"),
+    ("use", "Switch project: /use <name>"),
+    ("remote", "Set where to push: /remote <https github url>"),
+    ("push", "Push the project to GitHub"),
+    ("replan", "Redo the plan (only before anything is built)"),
+    ("help", "Show commands"),
 ]
 
 
@@ -170,7 +170,7 @@ def watch(job):
 
 
 # ----------------------------------------------------------------- commands
-HELP = "Commands:\n" + "\n".join("/%s" % d for _, d in COMMANDS)
+HELP = "Commands:\n" + "\n".join("/%s - %s" % (c, d) for c, d in COMMANDS)
 
 
 def need_project(chat):
